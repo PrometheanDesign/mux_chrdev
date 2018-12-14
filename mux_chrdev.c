@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*  
  *  mux_chrdev - character device multiplexor
+ *
+ *  Copyright (C) 2018  Scott Wagner <scott.wagner@promethean-design.com>
+ *
  */
 #include <linux/module.h>	/* Needed by all modules */
 #include <linux/kernel.h>	/* Needed for KERN_INFO */
@@ -13,11 +17,13 @@
 #include <linux/poll.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Scott Wagner");
 MODULE_DESCRIPTION("Mux Character Device Module");
 
 #define N_DEVICES 2
+#define LOGBUF_LEN 65500
 //#define MUX_CHRDEV_DEBUG
 
 static const char * const device_name = "mux_chrdev";	/* Dev name as it appears in /proc/devices   */
@@ -46,6 +52,9 @@ struct muxdev_data {
     struct mutex mx;
 	struct inode inode;
     struct file file;
+    char *log_buffer;
+    char *log_buffer_tail;
+    char *log_buffer_end;
 };
 static struct muxdev_data *gptd;
 
@@ -65,6 +74,38 @@ static int open_backing_dev(struct muxdev_data *ptd) {
         memset(&ptd->file, 0, sizeof(struct file));
     }
     return rc;
+}
+
+static void write_log_buffer(struct muxdev_data *ptd, int is_send, void *buf, unsigned int len)
+{
+    int entry_length_estimate = 80 + (len*54 + 15)/16;
+    struct timespec t;
+    int i;
+    unsigned char *sp = (unsigned char *)buf;
+    get_monotonic_boottime(&t);
+    if (ptd->log_buffer != NULL) {
+        if (ptd->log_buffer_tail + entry_length_estimate >= ptd->log_buffer_end) {
+            ptd->log_buffer_tail = ptd->log_buffer;
+        }
+        if (is_send != 0) {
+            ptd->log_buffer_tail += sprintf(ptd->log_buffer_tail, "[%5ld.%06ld] ==>  %d:%d write %d to %d:%d",
+                    t.tv_sec, t.tv_nsec/1000L, MAJOR(ptd->active_device), MINOR(ptd->active_device),
+                    len, MAJOR(ptd->backing_dev), MINOR(ptd->backing_dev));
+        } else {
+            ptd->log_buffer_tail += sprintf(ptd->log_buffer_tail, "[%5ld.%06ld] <== %d:%d read %d from %d:%d",
+                    t.tv_sec, t.tv_nsec/1000L, MAJOR(ptd->active_device), MINOR(ptd->active_device),
+                    len, MAJOR(ptd->backing_dev), MINOR(ptd->backing_dev));
+        }
+        for (i = 0; i < len; i++) {
+            if ((i & 0xF) == 0) {
+                ptd->log_buffer_tail += sprintf(ptd->log_buffer_tail, "\n%04x ", i);
+            }
+            ptd->log_buffer_tail += sprintf(ptd->log_buffer_tail, " %02x", sp[i]);
+        }
+        *ptd->log_buffer_tail++ = '\n';
+        *ptd->log_buffer_tail = 0;
+    }
+    return;
 }
 
 static loff_t device_llseek(struct file *filp, loff_t offset, int whence)
@@ -120,6 +161,12 @@ static ssize_t device_read(struct file *filp, char __user *buf, size_t len, loff
     }
     mutex_unlock(&ptd->mx);
     rc = (*ptd->file.f_op->read)(&ptd->file, buf, len, off);
+    if (rc > 0 && ptd->log_buffer != NULL) {
+        char lbuf[rc];
+        if (copy_from_user(lbuf, buf, rc) == 0) {
+            write_log_buffer(ptd, 0, lbuf, rc);
+        }
+    }
     mutex_lock(&ptd->mx);
     del_timer(&ptd->timer);
     ptd->active_device = 0;
@@ -166,6 +213,12 @@ static ssize_t device_write(struct file *filp, const char __user *buf, size_t le
     }
     mutex_unlock(&ptd->mx);
     rc = (*ptd->file.f_op->write)(&ptd->file, buf, len, off);
+    if (rc > 0 && ptd->log_buffer != NULL) {
+        char lbuf[rc];
+        if (copy_from_user(lbuf, buf, rc) == 0) {
+            write_log_buffer(ptd, 1, lbuf, rc);
+        }
+    }
     #ifdef MUX_CHRDEV_DEBUG
  	printk(KERN_INFO "%s device_write() minor %d len %d\n", device_name, MINOR(filp->f_inode->i_rdev), (int)len);
     #endif
@@ -379,6 +432,52 @@ static void muxdev_timer(struct timer_list *t) {
     return;    
 }
 
+static ssize_t muxdev_log_show(struct class *class,
+        struct class_attribute *attr, char *buf)
+{
+    struct muxdev_data *ptd = gptd;
+    ssize_t len;
+    if (ptd->log_buffer == NULL || ptd->log_buffer_tail == ptd->log_buffer) {
+        *(char *)buf = 0;
+        len = 1;
+        return len;
+    }
+    len = (ptd->log_buffer_tail - ptd->log_buffer) + 1;
+    if (len >= PAGE_SIZE) {
+        memcpy(buf, ptd->log_buffer, PAGE_SIZE - 1);
+        *((char *)buf + PAGE_SIZE - 1) = 0;
+        memmove(ptd->log_buffer, ptd->log_buffer + PAGE_SIZE - 1, len + 1 - PAGE_SIZE);
+        ptd->log_buffer_tail -= PAGE_SIZE - 1;
+        len = PAGE_SIZE;
+    } else {
+        memcpy(buf, ptd->log_buffer, len);
+        ptd->log_buffer_tail = ptd->log_buffer;
+    }
+    return len;
+}
+
+static ssize_t muxdev_log_store(struct class *class,
+        struct class_attribute *attr, const char *buf, size_t count)
+{
+    struct muxdev_data *ptd = gptd;
+    int enable_buf = (simple_strtol(buf, NULL, 10) > 0);
+    if (enable_buf && ptd->log_buffer == NULL) {
+        ptd->log_buffer = kzalloc(LOGBUF_LEN, GFP_KERNEL);
+        ptd->log_buffer_tail = ptd->log_buffer;
+        ptd->log_buffer_end = ptd->log_buffer + LOGBUF_LEN;
+    } else if (!enable_buf && ptd->log_buffer != NULL) {
+        kfree(ptd->log_buffer);
+        ptd->log_buffer = NULL;
+        ptd->log_buffer_tail = NULL;
+        ptd->log_buffer_end = NULL;
+    }
+    return count;
+}
+
+static const struct class_attribute class_attr_muxdev_log = __ATTR(muxdev_log,
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+        muxdev_log_show, muxdev_log_store);
+
 static int __init mux_init(void)
 {
     int i;
@@ -403,7 +502,8 @@ static int __init mux_init(void)
         kfree(gptd);
 	    return i;
 	}
-    if ((gptd->pclass = class_create(THIS_MODULE, class_name)) == NULL) {
+    if ((gptd->pclass = class_create(THIS_MODULE, class_name)) == NULL ||
+            class_create_file(gptd->pclass, &class_attr_muxdev_log) != 0) {
         for (i = 0; i < N_DEVICES; i++) {
             cdev_del(gptd->pcdev[i]);
         }
@@ -441,6 +541,7 @@ static void __exit mux_exit(void)
     for (i = 0; i < N_DEVICES; i++) {
         device_destroy(gptd->pclass,  gptd->mux_dev + i);
     }
+    class_remove_file(gptd->pclass, &class_attr_muxdev_log);
     class_destroy(gptd->pclass);
     for (i = 0; i < N_DEVICES; i++) {
         cdev_del(gptd->pcdev[i]);
