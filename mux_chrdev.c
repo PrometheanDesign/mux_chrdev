@@ -31,12 +31,15 @@ static const char * const class_name = "m_chrdev";	/* Class name */
 static short target_major = 0;  /* Major device number of the target device */
 static short target_minor = 0;  /* Minor device number of the target device */
 static short timeout = 500;  /* Device lock timeout - mS (0 => no timeout) */
+static short delay_time = 50;  /* Device recovery delay time - mS (0 => no delay) */
 module_param(target_major, short,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
 MODULE_PARM_DESC(target_major, "Major device number of the target device");
 module_param(target_minor, short,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
 MODULE_PARM_DESC(target_minor, "Minor device number of the target device");
 module_param(timeout, short,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
 MODULE_PARM_DESC(timeout, "Device lock timeout - mS (0 => no timeout)");
+module_param(delay_time, short,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+MODULE_PARM_DESC(delay_time, "Device recovery delay time - mS (0 => no delay)");
 
 struct muxdev_data {
     dev_t mux_dev;
@@ -44,6 +47,7 @@ struct muxdev_data {
     struct cdev *pcdev[N_DEVICES];
     struct device *muxdev_device[N_DEVICES];
     dev_t active_device; /* Device which currently has control, or 0 if free */
+    dev_t delayed_device; /* Device which previously had control, or 0 if free */
     struct class *pclass;
     int rdlen;
     dev_t backing_dev;
@@ -137,7 +141,7 @@ static ssize_t device_read(struct file *filp, char __user *buf, size_t len, loff
     }
     mutex_lock(&ptd->mx);
     if (ptd->active_device != filp->f_inode->i_rdev) {
-        if (ptd->active_device != 0) {
+        if (ptd->active_device != 0 || ptd->delayed_device == filp->f_inode->i_rdev) {
             #ifdef MUX_CHRDEV_DEBUG
             printk(KERN_INFO "%s device_read() minor %d blocks : user %d:%d\n", device_name,
                     MINOR(filp->f_inode->i_rdev), MAJOR(ptd->active_device), MINOR(ptd->active_device));
@@ -147,7 +151,8 @@ static ssize_t device_read(struct file *filp, char __user *buf, size_t len, loff
                 return -EAGAIN;
             } else {
                 mutex_unlock(&ptd->mx);
-                if (wait_event_interruptible(ptd->mq, (ptd->active_device == 0)) != 0) {
+                if (wait_event_interruptible(ptd->mq, (ptd->active_device == 0 &&
+                        ptd->delayed_device != filp->f_inode->i_rdev)) != 0) {
                     return -ERESTARTSYS;
                 }
                 mutex_lock(&ptd->mx);
@@ -168,8 +173,9 @@ static ssize_t device_read(struct file *filp, char __user *buf, size_t len, loff
         }
     }
     mutex_lock(&ptd->mx);
-    del_timer(&ptd->timer);
+    mod_timer(&ptd->timer, jiffies + delay_time*HZ/1000);
     ptd->active_device = 0;
+    ptd->delayed_device = filp->f_inode->i_rdev;
     mutex_unlock(&ptd->mx);
     wake_up_interruptible(&ptd->mq);
     #ifdef MUX_CHRDEV_DEBUG
@@ -189,7 +195,7 @@ static ssize_t device_write(struct file *filp, const char __user *buf, size_t le
     }
     mutex_lock(&ptd->mx);
     if (ptd->active_device != filp->f_inode->i_rdev) {
-        if (ptd->active_device != 0) {
+        if (ptd->active_device != 0 || ptd->delayed_device == filp->f_inode->i_rdev) {
             #ifdef MUX_CHRDEV_DEBUG
             printk(KERN_INFO "%s device_write() minor %d blocks : user %d:%d\n", device_name,
                 MINOR(filp->f_inode->i_rdev), MAJOR(ptd->active_device), MINOR(ptd->active_device));
@@ -199,7 +205,8 @@ static ssize_t device_write(struct file *filp, const char __user *buf, size_t le
                 return -EAGAIN;
             } else {
                 mutex_unlock(&ptd->mx);
-                if (wait_event_interruptible(ptd->mq, (ptd->active_device == 0)) != 0) {
+                if (wait_event_interruptible(ptd->mq, (ptd->active_device == 0 &&
+                        ptd->delayed_device != filp->f_inode->i_rdev)) != 0) {
                     return -ERESTARTSYS;
                 }
                 mutex_lock(&ptd->mx);
@@ -318,8 +325,8 @@ static unsigned int device_poll(struct file *filp, poll_table *wait)
     struct muxdev_data *ptd = (struct muxdev_data *)filp->private_data;
     unsigned int mask = 0;
     // If we own the lock right now, poll looks at the backing device poll
-    if (ptd->active_device == filp->f_inode->i_rdev ||
-            ptd->active_device == 0) {
+    if (ptd->active_device == filp->f_inode->i_rdev || (ptd->active_device == 0
+            && ptd->delayed_device != filp->f_inode->i_rdev)) {
         if (ptd->file.f_op == NULL) {
             return -ENXIO;
         } else if (ptd->file.f_op->poll == NULL) {
@@ -377,8 +384,9 @@ static int device_fasync(int fd, struct file *filp, int on)
         rc = (*ptd->file.f_op->fasync)(fd, &ptd->file, on);
         mutex_lock(&ptd->mx);
     }
-    del_timer(&ptd->timer);
+    mod_timer(&ptd->timer, jiffies + delay_time*HZ/1000);
     ptd->active_device = 0;
+    ptd->delayed_device = filp->f_inode->i_rdev;
     mutex_unlock(&ptd->mx);
     wake_up_interruptible(&ptd->mq);
     #ifdef MUX_CHRDEV_DEBUG
@@ -424,10 +432,21 @@ static struct file_operations fops = {
 
 static void muxdev_timer(struct timer_list *t) {
     struct muxdev_data *ptd = (struct muxdev_data *)from_timer(ptd, t, timer);
-    #ifdef MUX_CHRDEV_DEBUG
-	printk(KERN_INFO "%s Timer expired - removing minor %d lock\n", device_name, MINOR(ptd->active_device));
-    #endif
-    ptd->active_device = 0;
+    if (ptd->active_device != 0) {
+        if (delay_time > 0) {
+            ptd->delayed_device = ptd->active_device;
+            mod_timer(&ptd->timer, jiffies + delay_time*HZ/1000);
+        }
+        #ifdef MUX_CHRDEV_DEBUG
+	    printk(KERN_INFO "%s Timer expired - removing minor %d lock\n", device_name, MINOR(ptd->active_device));
+        #endif
+        ptd->active_device = 0;
+    } else {
+        #ifdef MUX_CHRDEV_DEBUG
+	    printk(KERN_INFO "%s Timer expired - removing minor %d delay\n", device_name, MINOR(ptd->delayed_device));
+        #endif
+        ptd->delayed_device = 0;
+    }
     wake_up_interruptible(&ptd->mq);
     return;    
 }
